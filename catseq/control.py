@@ -9,12 +9,20 @@ from typing import Callable
 
 from catseq.morphism import Morphism
 from catseq.atomic import oasm_black_box
-from catseq.compilation.compiler import compile_to_oasm_calls, OASM_FUNCTION_MAP
+from catseq.compilation.compiler import (
+    compile_to_oasm_calls,
+    OASM_FUNCTION_MAP,
+    OASM_AVAILABLE,
+    execute_oasm_calls,
+    RTMQ_INSTRUCTION_COSTS,
+    _calculate_gap_cycles,
+)
 from catseq.compilation.types import OASMFunction
 from catseq.types.common import Channel, State, Board
 
-# Import OASM loop control functions
-from oasm.rtmq2 import for_, end, R
+# Import OASM loop control and analysis functions
+from oasm.rtmq2 import for_, end, R, disassembler
+from oasm.dev.rwg import C_RWG
 
 
 def extract_channel_states_from_morphism(morphism: Morphism) -> dict[Channel, tuple[State, State]]:
@@ -129,6 +137,153 @@ def morphism_to_precompiled_blackbox(
         board_funcs=board_funcs
     )
 
+def _parse_tim_value(value_str: str) -> int:
+    """Parse TIM immediate value (supports hex with underscores or decimal)."""
+    try:
+        # int(..., 0) 支持 0x 前缀和下划线分隔
+        return int(value_str.replace("_", ""), 0)
+    except ValueError:
+        return 0
+
+def _estimate_oasm_cost_with_timer(asm_lines: list[str]) -> int:
+    """
+    Estimate execution cycles from RTMQ assembly, with correct handling of TIM/NOP H timer blocks.
+
+    规则（基于 StdCohNode 文档）：
+    - 普通指令：记为 1 个周期（忽略流水线细节）
+    - 计时结构：
+        CLO - TIM T
+        ... (中间指令总耗时不超过 T-2 周期)
+        NOP H
+      整个结构视为 **精确 T 个周期**。
+    """
+    total_cycles = 0
+
+    timer_active = False
+    timer_value: int | None = None
+
+    # 参考编译器中的 _estimate_oasm_cost：跟踪最近指令用于 gap cycle 计算
+    instruction_history: list[tuple[str, str, int]] = []
+
+    for line in asm_lines:
+        parts = line.strip().split()
+        if not parts:
+            continue
+
+        instr = parts[0].upper()
+        flag = parts[1].upper() if len(parts) > 1 else "-"
+        target = parts[2].upper() if len(parts) > 2 else ""
+
+        # 计时结构：从 CLO - TIM T 到 NOP H
+        if not timer_active:
+            # 检测 CLO - TIM T，进入计时块
+            if instr == "CLO" and target == "TIM" and len(parts) >= 4:
+                timer_value = _parse_tim_value(parts[3])
+                timer_active = True
+                # CLO - TIM 自身不单独计入 1cycle，而是包含在 T 里
+                # 为了避免计时块对后续 gap 计算产生影响，清空历史
+                instruction_history.clear()
+                continue
+
+            # --- 非计时块普通指令：参考 _estimate_oasm_cost 的做法 ---
+
+            # 特殊情况：跳转（写 PTR 且带 P 标志）总是 10 cycles
+            if instr in {"AMK", "CLO"} and target == "PTR" and flag == "P":
+                total_cycles += 10
+                instruction_history.append(("JUMP_PTR", target, 0))
+                if len(instruction_history) > 3:
+                    instruction_history.pop(0)
+                continue
+
+            # 基础指令开销
+            cost = RTMQ_INSTRUCTION_COSTS.get(instr, 1)
+
+            # P 标志：额外 6 个周期（NOP P 等）
+            if flag == "P":
+                cost += 6
+
+            # 流水线 gap cycles
+            gap_cycles = _calculate_gap_cycles(instr, target, instruction_history)
+
+            total_cycles += cost + gap_cycles
+
+            # 维护有限长度的指令历史
+            instruction_history.append((instr, target, 0))
+            if len(instruction_history) > 3:
+                instruction_history.pop(0)
+
+        else:
+            # 已在计时块中，直到 NOP H 结束
+            if instr == "NOP" and flag == "H":
+                # 计时结构总耗时 = T 个周期
+                if timer_value is not None and timer_value > 0:
+                    total_cycles += timer_value
+                else:
+                    # 解析失败时保守按 1 cycle 处理
+                    total_cycles += 1
+
+                timer_active = False
+                timer_value = None
+
+                # 计时块结束后清空历史，避免计时块内部指令影响后续 gap 计算
+                instruction_history.clear()
+                continue
+
+            # 计时块内部其它指令成本由 T 覆盖，这里不再累加
+            continue
+
+    return total_cycles
+
+def _estimate_morphism_cycles_from_assembly(
+    morphism: Morphism,
+    assembler_seq,
+) -> int:
+    """
+    Estimate morphism execution time per iteration (in cycles) from compiled RTMQ assembly.
+
+    If OASM is not available or compilation fails, falls back to morphism.total_duration_cycles.
+    """
+    # If we don't have an assembler or OASM support, fall back to logical duration
+    if assembler_seq is None or not OASM_AVAILABLE:
+        return morphism.total_duration_cycles
+
+    try:
+        # 1. Compile Morphism to final scheduled OASM calls
+        calls_by_board = compile_to_oasm_calls(morphism, assembler_seq)
+
+        # 2. Execute OASM calls into the assembler to generate binary assembly
+        success, _ = execute_oasm_calls(calls_by_board, assembler_seq, clear=True, verbose=False)
+        if not success:
+            print("========not_success=======")
+            return morphism.total_duration_cycles
+
+        # 3. Disassemble and estimate cost from RTMQ assembly for each board
+        max_cost = 0
+        for board_adr in calls_by_board.keys():
+            board_name = board_adr.value
+            # print(board_adr)
+            try:
+                binary_asm = assembler_seq.asm[board_name]
+            except Exception:
+                continue
+
+            try:
+                asm_lines = disassembler(core=C_RWG)(binary_asm)
+                # for line in asm_lines:
+                #     print(line)
+            except Exception:
+                continue
+
+            cost = _estimate_oasm_cost_with_timer(asm_lines)
+            if cost > max_cost:
+                max_cost = cost
+
+        return max_cost or morphism.total_duration_cycles
+    except Exception:
+        # On any unexpected error, be conservative and fall back
+        return morphism.total_duration_cycles
+
+
 
 def repeat_morphism(
     morphism: Morphism,
@@ -153,7 +308,10 @@ def repeat_morphism(
         raise ValueError("Repeat count must be positive")
 
     # Get morphism timing and channel states
-    t_morphism = morphism.total_duration_cycles
+    # Get morphism timing (from compiled assembly) and channel states
+    t_morphism = _estimate_morphism_cycles_from_assembly(morphism, assembler_seq)
+    # print(t_morphism)
+    # t_morphism = morphism.total_duration_cycles
     channel_states = extract_channel_states_from_morphism(morphism)
 
     # Calculate total execution time using the loop timing formula:
@@ -164,7 +322,7 @@ def repeat_morphism(
     # - 26: Per-iteration overhead (13 cycles condition + 13 cycles increment/jump)
     # - t_morphism: Morphism execution time per iteration
     LOOP_FIXED_OVERHEAD = 15
-    LOOP_PER_ITERATION_OVERHEAD = 26
+    LOOP_PER_ITERATION_OVERHEAD = 24
 
     total_duration_cycles = LOOP_FIXED_OVERHEAD + count * (LOOP_PER_ITERATION_OVERHEAD + t_morphism)
 
