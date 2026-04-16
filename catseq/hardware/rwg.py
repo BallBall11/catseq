@@ -127,6 +127,8 @@ def linear_ramp(targets: List[Optional[StaticWaveform]], duration: float) -> Mor
         end_waveforms = []
 
         for target, current_wf in zip(targets, active_waveforms):
+            if target is None:
+                continue
             if target.fct != current_wf.fct:
                 raise ValueError(
                     f"Target fct ({target.fct}) does not match current waveform fct ({current_wf.fct}) "
@@ -417,7 +419,7 @@ def gen_coeff(start, end, n_knots, T, func):
     return rtmq_params, dur
 
 
-def spline_arbi_func_ramp(targets: List[Optional[StaticWaveform]], duration: float, trace, n_knots:int = 11, ) -> MorphismDef:
+def spline_arbi_func_ramp(targets: List[Optional[StaticWaveform]], duration: float, trace_f, trace_a, n_knots:int = 11, ) -> MorphismDef:
     """Creates a definition for a cubic ramp with phase continuity.
 
     This ensures smooth start/stop (zero derivative at endpoints is NOT guaranteed;
@@ -467,14 +469,14 @@ def spline_arbi_func_ramp(targets: List[Optional[StaticWaveform]], duration: flo
             duration_us = duration * 1e6
             # --- Frequency: still use linear ramp (or static) ---
             if target_freq != start_freq:
-                freq_coeffs, durs_us = gen_coeff(start_freq, target_freq, n_knots, duration_us, trace)
+                freq_coeffs, durs_us = gen_coeff(start_freq, target_freq, n_knots, duration_us, trace_f)
             else:
                 freq_coeffs = [[start_freq, None, None, None]]* (n_knots-1)
 
             # --- Amplitude: use cubic polynomial in MICROSECONDS ---
             if target_amp != start_amp:
                 # Compute cubic coefficients in SECONDS first
-                amp_coeffs, durs_us = gen_coeff(start_amp, target_amp, n_knots, duration_us, trace)
+                amp_coeffs, durs_us = gen_coeff(start_amp, target_amp, n_knots, duration_us, trace_a)
             else:
                 amp_coeffs = [[start_amp, None, None, None]] * (n_knots-1)
             t_knots = np.linspace(0, duration_us, n_knots)

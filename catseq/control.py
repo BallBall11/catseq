@@ -21,7 +21,7 @@ from catseq.compilation.types import OASMFunction
 from catseq.types.common import Channel, State, Board
 
 # Import OASM loop control and analysis functions
-from oasm.rtmq2 import for_, end, R, disassembler, Func, call, function as rtmq_function
+from oasm.rtmq2 import for_, end, R, disassembler, Func, call, function as rtmq_function, core_domain
 from oasm.dev.rwg import C_RWG
 
 
@@ -369,6 +369,8 @@ def function_def_morphism(
     morphism: Morphism,
     name: str,
     assembler_seq,
+    args:int=0,
+    locals:int=0,
 ) -> Morphism:
     """
     Construct a hardware-level Morphism that defines a reusable function.
@@ -411,7 +413,7 @@ def function_def_morphism(
         """
         def func_executor():
             call("_start")
-            with Func(name,2,2):
+            with Func(name,args+2,2+args+locals):
                 # Execute the core logic of the morphism
                 base_func()
             rtmq_function("_start")
@@ -438,6 +440,7 @@ def function_call_morphism(
     morphism: Morphism,
     name: str,
     assembler_seq,
+    *args,
 ) -> Morphism:
     """
     Construct a hardware-level Morphism that invokes a previously defined function.
@@ -476,7 +479,7 @@ def function_call_morphism(
         """
         def func_executor():
             # Issue the hardware call to the specified function name
-            call(name)
+            call(name, *args)
 
         return func_executor
 
