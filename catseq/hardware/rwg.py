@@ -6,7 +6,7 @@ These functions return MorphismDefs, which can be composed together
 using the >> operator to build complex sequences.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Callable
 
 from ..debug import factory_breadcrumb
 from ..expr import Expr
@@ -434,7 +434,7 @@ def gen_coeff(start, end, n_knots, T, func):
     return rtmq_params, dur
 
 
-def spline_arbi_func_ramp(targets: List[Optional[StaticWaveform]], duration: float, trace_f, trace_a, n_knots:int = 11, ) -> MorphismDef:
+def spline_arbi_func_ramp(targets: List[Optional[StaticWaveform]], duration: float, trace_f:Callable, trace_a:Callable, n_knots:int = 11, ) -> MorphismDef:
     """Creates a definition for a cubic ramp with phase continuity.
 
     This ensures smooth start/stop (zero derivative at endpoints is NOT guaranteed;
