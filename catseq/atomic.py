@@ -6,8 +6,8 @@ which are the fundamental building blocks of sequences.
 """
 from typing import List, Union, Callable, Dict, Tuple
 
+from .debug import factory_breadcrumb
 from .morphism import Morphism, from_atomic, Lane
-from .time_utils import time_to_cycles
 from .types.common import (
     Board,
     Channel, 
@@ -31,7 +31,8 @@ def ttl_init(channel: Channel, initial_state: TTLState = TTLState.OFF) -> Morphi
         start_state=None,
         end_state=initial_state,
         duration_cycles=2,
-        operation_type=OperationType.TTL_INIT
+        operation_type=OperationType.TTL_INIT,
+        debug_trace=(factory_breadcrumb(stacklevel=1),),
     )
     return from_atomic(op)
 
@@ -42,7 +43,8 @@ def ttl_on(channel: Channel, start_state: State = TTLState.OFF) -> Morphism:
         start_state=start_state,
         end_state=TTLState.ON,
         duration_cycles=1,
-        operation_type=OperationType.TTL_ON
+        operation_type=OperationType.TTL_ON,
+        debug_trace=(factory_breadcrumb(stacklevel=1),),
     )
     return from_atomic(op)
 
@@ -53,7 +55,8 @@ def ttl_off(channel: Channel, start_state: State = TTLState.ON) -> Morphism:
         start_state=start_state,
         end_state=TTLState.OFF,
         duration_cycles=1,
-        operation_type=OperationType.TTL_OFF
+        operation_type=OperationType.TTL_OFF,
+        debug_trace=(factory_breadcrumb(stacklevel=1),),
     )
     return from_atomic(op)
 
@@ -65,6 +68,7 @@ def rwg_board_init(channel: Channel) -> Morphism:
         end_state=RWGUninitialized(),  # Still uninitialized until carrier is set
         duration_cycles=1,  # All atomic operations use 1 cycle for stable compiler ordering
         operation_type=OperationType.RWG_INIT,
+        debug_trace=(factory_breadcrumb(stacklevel=1),),
     )
     return from_atomic(op)
 
@@ -76,6 +80,7 @@ def rwg_set_carrier(channel: Channel, carrier_freq: float) -> Morphism:
         end_state=RWGReady(carrier_freq=carrier_freq),
         duration_cycles=1,  # All atomic operations use 1 cycle for stable compiler ordering
         operation_type=OperationType.RWG_SET_CARRIER,
+        debug_trace=(factory_breadcrumb(stacklevel=1),),
     )
     return from_atomic(op)
 
@@ -110,6 +115,7 @@ def rwg_load_coeffs(
         end_state=end_state,
         duration_cycles=1,  # All atomic operations use 1 cycle for stable compiler ordering
         operation_type=OperationType.RWG_LOAD_COEFFS,
+        debug_trace=(factory_breadcrumb(stacklevel=1),),
     )
     return from_atomic(op)
 
@@ -131,6 +137,7 @@ def rwg_update_params(
         end_state=end_state,
         duration_cycles=0,  
         operation_type=OperationType.RWG_UPDATE_PARAMS,
+        debug_trace=(factory_breadcrumb(stacklevel=1),),
     )
     return from_atomic(op)
 
@@ -187,6 +194,7 @@ def oasm_black_box(
             end_state=end_state,
             duration_cycles=duration_cycles,
             operation_type=OperationType.OPAQUE_OASM_FUNC,
+            debug_trace=(factory_breadcrumb(stacklevel=1),),
             user_func=board_func,
             user_args=user_args,
             user_kwargs=user_kwargs,

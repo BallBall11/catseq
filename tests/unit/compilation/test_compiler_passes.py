@@ -2,25 +2,30 @@
 Unit tests for the CatSeq compiler passes.
 """
 import pytest
-from catseq.compilation.compiler import (
-    _pass1_extract_and_translate,
-    _pass2_cost_and_epoch_analysis,
-    _pass3_schedule_and_optimize,
-    _pass4_validate_constraints,
-    _pass4_generate_oasm_calls,
-    _estimate_oasm_cost,
-    _identify_pipeline_pairs,
-    _calculate_optimal_schedule,
-    OASM_FUNCTION_MAP
+from catseq.compilation.compiler import compile_to_oasm_calls
+from catseq.compilation.pipeline import (
+    LogicalEvent,
+    analyze_costs_and_epochs,
+    calculate_optimal_schedule,
+    detect_epoch_boundaries,
+    extract_and_translate,
+    generate_scheduled_calls,
+    identify_pipeline_pairs,
+    schedule_and_optimize,
+    validate_serial_load_constraints,
+    validate_rwg_load_play_ownership,
+    validate_constraints,
 )
-from catseq.compilation.types import OASMAddress, OASMFunction, OASMCall
+from catseq.compilation.timing_analysis import estimate_oasm_cost
+from catseq.compilation.types import OASMAddress, OASMFunction
 from catseq.compilation.functions import rwg_load_waveform
-from catseq.types.common import OperationType, AtomicMorphism, Board, Channel, ChannelType
-from catseq.types.rwg import WaveformParams, RWGReady, RWGActive
-from catseq.morphism import Morphism, identity
-from catseq.lanes import Lane
+from catseq.types.common import OperationType, Board, Channel, ChannelType
+from catseq.types.rwg import WaveformParams, RWGReady, RWGActive, StaticWaveform
+from catseq.types.ttl import TTLState
+from catseq.morphism import identity
 from catseq.atomic import rwg_load_coeffs, rwg_update_params
-from catseq.hardware import rwg
+from catseq.hardware import rwg, ttl
+from catseq.hardware.sync import global_sync
 from catseq import us  # Import microsecond unit
 
 # Mock OASM assembler and disassembler if not available
@@ -32,6 +37,139 @@ try:
     OASM_AVAILABLE = True
 except ImportError:
     OASM_AVAILABLE = False
+
+
+def test_epoch_rebased_after_global_sync():
+    main_board = Board("main")
+    rwg0_board = Board("rwg0")
+    main_ch = Channel(main_board, 0, ChannelType.TTL)
+    rwg0_ch = Channel(rwg0_board, 0, ChannelType.TTL)
+
+    pre_sync = (identity(10 * us) >> ttl.on()(main_ch, start_state=TTLState.OFF)) | (
+        identity(10 * us) >> ttl.on()(rwg0_ch, start_state=TTLState.OFF)
+    )
+    post_sync = (identity(5 * us) >> ttl.off()(main_ch, start_state=TTLState.ON)) | (
+        identity(5 * us) >> ttl.off()(rwg0_ch, start_state=TTLState.ON)
+    )
+
+    morphism = (pre_sync >> global_sync()) >> post_sync
+    events_by_board = extract_and_translate(morphism)
+    analyze_costs_and_epochs(events_by_board)
+
+    for adr, events in events_by_board.items():
+        ttl_events = [e for e in events if e.operation.operation_type in {OperationType.TTL_ON, OperationType.TTL_OFF}]
+        sync_events = [e for e in events if e.operation.operation_type in {OperationType.SYNC_MASTER, OperationType.SYNC_SLAVE}]
+
+        assert len(sync_events) == 1
+        assert ttl_events[0].epoch == 0
+        assert ttl_events[1].epoch == 1
+        assert ttl_events[1].logical_timestamp.time_offset_cycles == 1250
+
+    calls_by_board = generate_scheduled_calls(events_by_board)
+    for board_calls in calls_by_board.values():
+        sync_index = next(
+            i
+            for i, call in enumerate(board_calls)
+            if call.dsl_func in {OASMFunction.TRIG_SLAVE, OASMFunction.WAIT_MASTER}
+        )
+        assert board_calls[sync_index + 1].dsl_func == OASMFunction.WAIT
+        assert board_calls[sync_index + 1].args[0] == 1250
+
+
+def test_same_timestamp_sync_stays_in_same_epoch_and_schedules_last():
+    main_board = Board("main")
+    rwg0_board = Board("rwg0")
+    main_sync_ch = Channel(main_board, 0, ChannelType.TTL)
+    main_ttl_ch = Channel(main_board, 1, ChannelType.TTL)
+    rwg0_sync_ch = Channel(rwg0_board, 0, ChannelType.TTL)
+
+    morphism = (
+        global_sync()(main_sync_ch, start_state=TTLState.OFF)
+        | ttl.on()(main_ttl_ch, start_state=TTLState.OFF)
+        | global_sync()(rwg0_sync_ch, start_state=TTLState.OFF)
+    )
+
+    events_by_board = extract_and_translate(morphism)
+    analyze_costs_and_epochs(events_by_board)
+
+    main_events = events_by_board[OASMAddress.MAIN]
+    main_sync_event = next(
+        event for event in main_events if event.operation.operation_type == OperationType.SYNC_MASTER
+    )
+    main_ttl_event = next(
+        event for event in main_events if event.operation.operation_type == OperationType.TTL_ON
+    )
+
+    assert main_sync_event.epoch == 0
+    assert main_ttl_event.epoch == 0
+    assert main_sync_event.logical_timestamp.time_offset_cycles == 0
+    assert main_ttl_event.logical_timestamp.time_offset_cycles == 0
+
+    calls_by_board = generate_scheduled_calls(events_by_board)
+    main_funcs = [call.dsl_func for call in calls_by_board[OASMAddress.MAIN]]
+    assert main_funcs.index(OASMFunction.TTL_SET) < main_funcs.index(OASMFunction.TRIG_SLAVE)
+
+
+def test_partial_sync_boundary_is_rejected():
+    main_board = Board("main")
+    rwg0_board = Board("rwg0")
+    main_sync_ch = Channel(main_board, 0, ChannelType.TTL)
+    rwg0_ttl_ch = Channel(rwg0_board, 0, ChannelType.TTL)
+
+    morphism = global_sync()(main_sync_ch, start_state=TTLState.OFF) | ttl.on()(
+        rwg0_ttl_ch, start_state=TTLState.OFF
+    )
+
+    with pytest.raises(ValueError, match="Incomplete global sync boundary"):
+        compile_to_oasm_calls(morphism)
+
+
+def test_single_board_global_sync_is_rejected():
+    main_board = Board("main")
+    main_sync_ch = Channel(main_board, 0, ChannelType.TTL)
+
+    morphism = global_sync()(main_sync_ch, start_state=TTLState.OFF)
+
+    with pytest.raises(ValueError, match="Invalid global sync boundary"):
+        compile_to_oasm_calls(morphism)
+
+
+def test_serial_load_constraint_reports_atomic_origin():
+    board = Board("rwg0")
+    channel = Channel(board, 0, ChannelType.RWG)
+
+    waveform = WaveformParams(
+        sbg_id=1,
+        freq_coeffs=(10.0, 0.1, None, None),
+        amp_coeffs=(0.5, 0.01, None, None),
+        initial_phase=1.57,
+        phase_reset=True,
+    )
+    start_state = RWGReady(carrier_freq=100e6)
+
+    first_load = rwg_load_coeffs(channel, params=[waveform], start_state=start_state)
+    second_load = rwg_load_coeffs(channel, params=[waveform], start_state=start_state)
+
+    first_event = LogicalEvent(
+        timestamp_cycles=100,
+        operation=first_load.lanes[channel].operations[0],
+        cost_cycles=14,
+    )
+    second_event = LogicalEvent(
+        timestamp_cycles=110,
+        operation=second_load.lanes[channel].operations[0],
+        cost_cycles=14,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        validate_serial_load_constraints(OASMAddress.RWG0, [first_event, second_event])
+
+    message = str(exc_info.value)
+    assert "Serial constraint violation on board rwg0" in message
+    assert "load1: RWG_LOAD_COEFFS on rwg0_RWG_0" in message
+    assert "load2: RWG_LOAD_COEFFS on rwg0_RWG_0" in message
+    assert "tests/unit/compilation/test_compiler_passes.py" in message
+    assert "test_serial_load_constraint_reports_atomic_origin()" in message
 
 @pytest.mark.skipif(not OASM_AVAILABLE, reason="OASM library not installed")
 def test_pass1_and_pass2_rwg_load_coeffs_cost_analysis():
@@ -71,8 +209,6 @@ def test_pass1_and_pass2_rwg_load_coeffs_cost_analysis():
     run_all = run_cfg(intf, rwgs)
     
     # Create the assembler sequence with single board configuration
-    assembler_seq = assembler(run_all, [('rwg0', C_RWG)])
-
     # 3. Calculate the Expected Cost (Golden Standard)
     # Use the same assembler for both golden standard and cost analysis
     test_seq = assembler(run_all, [('rwg0', C_RWG)])
@@ -83,20 +219,20 @@ def test_pass1_and_pass2_rwg_load_coeffs_cost_analysis():
     golden_asm_lines = disassembler(core=C_RWG)(golden_binary_asm)
     # print("Golden standard assembly:", golden_asm_lines)
     
-    expected_cost = _estimate_oasm_cost(golden_asm_lines)
+    expected_cost = estimate_oasm_cost(golden_asm_lines)
     assert expected_cost == 14, f"Expected cost should be exactly 14 cycles, got {expected_cost}"
     
     # Note: Pass 2 will clear the assembler internally for clean cost analysis
 
     # 4. Run the Compiler Passes using the same assembler
     # Pass 0: Extract Events
-    events_by_board = _pass1_extract_and_translate(morphism)
+    events_by_board = extract_and_translate(morphism)
     
     # Pass 1: Translate to OASM
-    _pass2_cost_and_epoch_analysis(events_by_board)
+    analyze_costs_and_epochs(events_by_board)
 
     # Pass 2: Analyze Costs - Use the same assembler
-    _pass2_cost_and_epoch_analysis(events_by_board, test_seq)
+    analyze_costs_and_epochs(events_by_board, test_seq)
 
     # 5. Find the relevant event and Assert
     rwg0_events = events_by_board[OASMAddress.RWG0]
@@ -116,7 +252,7 @@ def test_pass1_and_pass2_rwg_load_coeffs_cost_analysis():
     assert load_event.cost_cycles == expected_cost, \
         f"Compiler cost ({load_event.cost_cycles}) != Golden standard cost ({expected_cost})"
 
-    print(f"\n✅ Test successful: RWG_LOAD_COEFFS cost correctly calculated as exactly 14 cycles.")
+    print("\n✅ Test successful: RWG_LOAD_COEFFS cost correctly calculated as exactly 14 cycles.")
 
 
 @pytest.mark.skipif(not OASM_AVAILABLE, reason="OASM library not installed")
@@ -177,8 +313,8 @@ def test_pass3_pipelining_constraint_checking():
     valid_sequence = play_morphism @ load_morphism
     
     # Run compiler passes
-    events_by_board = _pass1_extract_and_translate(valid_sequence)
-    _pass2_cost_and_epoch_analysis(events_by_board)
+    events_by_board = extract_and_translate(valid_sequence)
+    analyze_costs_and_epochs(events_by_board)
     
     # Set up assembler for cost analysis
     intf = sim_intf()
@@ -187,11 +323,11 @@ def test_pass3_pipelining_constraint_checking():
     run_all = run_cfg(intf, [0, 1])
     test_seq = assembler(run_all, [('rwg0', C_RWG)])
     
-    _pass2_cost_and_epoch_analysis(events_by_board, test_seq)
+    analyze_costs_and_epochs(events_by_board, test_seq)
     
     # Pass 3 should succeed without raising an exception
     try:
-        _pass4_validate_constraints(events_by_board)
+        validate_constraints(events_by_board)
         print("  ✅ Valid pipelining scenario passed constraint check")
     except ValueError as e:
         pytest.fail(f"Valid pipelining scenario should not fail constraint check: {e}")
@@ -213,17 +349,17 @@ def test_pass3_pipelining_constraint_checking():
     invalid_sequence = short_play_morphism @ load_morphism
     
     # Run compiler passes
-    events_by_board_invalid = _pass1_extract_and_translate(invalid_sequence)
-    _pass2_cost_and_epoch_analysis(events_by_board_invalid)
+    events_by_board_invalid = extract_and_translate(invalid_sequence)
+    analyze_costs_and_epochs(events_by_board_invalid)
     
     # Fresh assembler for second test
     test_seq_invalid = assembler(run_all, [('rwg0', C_RWG)])
-    _pass2_cost_and_epoch_analysis(events_by_board_invalid, test_seq_invalid)
+    analyze_costs_and_epochs(events_by_board_invalid, test_seq_invalid)
     
     # Pass 4 should succeed - the current implementation doesn't consider
     # PLAY-duration-too-short as a constraint violation in this context
     try:
-        _pass4_validate_constraints(events_by_board_invalid)
+        validate_constraints(events_by_board_invalid)
         print("  ✅ Constraint validation passed (current implementation allows this scenario)")
     except ValueError as e:
         pytest.fail(f"Current implementation should not raise constraint violation: {e}")
@@ -264,8 +400,8 @@ def test_pass4_oasm_call_generation_and_timing():
     print("  Created test morphism: 10μs delay + RWG_LOAD_COEFFS")
     
     # Run compiler passes up to Pass 3
-    events_by_board = _pass1_extract_and_translate(morphism)
-    _pass2_cost_and_epoch_analysis(events_by_board)
+    events_by_board = extract_and_translate(morphism)
+    analyze_costs_and_epochs(events_by_board)
     
     # Set up assembler for cost analysis
     intf = sim_intf()
@@ -274,12 +410,12 @@ def test_pass4_oasm_call_generation_and_timing():
     run_all = run_cfg(intf, [0, 1])
     test_seq = assembler(run_all, [('rwg0', C_RWG)])
     
-    _pass2_cost_and_epoch_analysis(events_by_board, test_seq)
-    _pass4_validate_constraints(events_by_board)
+    analyze_costs_and_epochs(events_by_board, test_seq)
+    validate_constraints(events_by_board)
     
     # Pass 4: Generate OASM calls
     print("  Running Pass 4 to generate OASM calls...")
-    oasm_calls_by_board = _pass4_generate_oasm_calls(events_by_board)
+    oasm_calls_by_board = generate_scheduled_calls(events_by_board)
     
     # Extract calls for single board
     assert len(oasm_calls_by_board) == 1
@@ -313,8 +449,8 @@ def test_pass4_oasm_call_generation_and_timing():
     load_params = load_call.args[0]
     assert isinstance(load_params, WaveformParams), f"Load call should have WaveformParams, got {type(load_params)}"
     assert load_params.sbg_id == 1, f"SBG ID should be 1, got {load_params.sbg_id}"
-    assert load_params.freq_coeffs == (10.0, 0.1, None, None), f"Freq coeffs mismatch"
-    print(f"  ✅ Load call correctly generated with proper parameters")
+    assert load_params.freq_coeffs == (10.0, 0.1, None, None), "Freq coeffs mismatch"
+    print("  ✅ Load call correctly generated with proper parameters")
     
     # Test timing validation - calls should be properly ordered
     if len(oasm_calls) > 2:
@@ -322,7 +458,7 @@ def test_pass4_oasm_call_generation_and_timing():
         for i in range(len(oasm_calls) - 1):
             current_call = oasm_calls[i]
             next_call = oasm_calls[i + 1]
-            assert current_call.adr == next_call.adr, f"All calls should be for same board in sequence"
+            assert current_call.adr == next_call.adr, "All calls should be for same board in sequence"
     
     print("✅ Pass 4 OASM call generation test completed successfully!")
 
@@ -374,8 +510,8 @@ def test_pass4_multiple_events_timing():
     
     print("  Created complex morphism: 5μs → load → 15μs → update(8μs)")
     # Run all compiler passes
-    events_by_board = _pass1_extract_and_translate(morphism)
-    _pass2_cost_and_epoch_analysis(events_by_board)
+    events_by_board = extract_and_translate(morphism)
+    analyze_costs_and_epochs(events_by_board)
     
     intf = sim_intf()
     intf.nod_adr = 0 
@@ -383,11 +519,11 @@ def test_pass4_multiple_events_timing():
     run_all = run_cfg(intf, [0, 1])
     test_seq = assembler(run_all, [('rwg0', C_RWG)])
     
-    _pass2_cost_and_epoch_analysis(events_by_board, test_seq)
-    _pass4_validate_constraints(events_by_board)
+    analyze_costs_and_epochs(events_by_board, test_seq)
+    validate_constraints(events_by_board)
     
     # Generate OASM calls
-    oasm_calls_by_board = _pass4_generate_oasm_calls(events_by_board)
+    oasm_calls_by_board = generate_scheduled_calls(events_by_board)
     
     # Extract calls for single board
     assert len(oasm_calls_by_board) == 1
@@ -450,7 +586,7 @@ def test_complete_compilation_pipeline():
     
     # Pass 0: Extract events from morphism 
     print("    Pass 0: Extracting events...")
-    events_by_board = _pass1_extract_and_translate(morphism)
+    events_by_board = extract_and_translate(morphism)
     
     # Verify Pass 0 results
     assert OASMAddress.RWG0 in events_by_board, "Expected RWG0 board events"
@@ -459,17 +595,17 @@ def test_complete_compilation_pipeline():
     
     # Pass 1: Translate to OASM calls
     print("    Pass 1: Translating to OASM...")
-    _pass2_cost_and_epoch_analysis(events_by_board)
+    analyze_costs_and_epochs(events_by_board)
     
     # Verify Pass 1 results - only non-identity events should have oasm_calls
     for event in rwg0_events:
-        assert hasattr(event, 'oasm_calls'), f"Event should have oasm_calls after Pass 1"
+        assert hasattr(event, 'oasm_calls'), "Event should have oasm_calls after Pass 1"
         if event.operation.operation_type != OperationType.IDENTITY:
-            assert len(event.oasm_calls) > 0, f"Non-identity event should have at least one OASM call"
+            assert len(event.oasm_calls) > 0, "Non-identity event should have at least one OASM call"
     
     # Pass 2: Analyze costs
     print("    Pass 2: Analyzing costs...")
-    _pass2_cost_and_epoch_analysis(events_by_board, test_seq)
+    analyze_costs_and_epochs(events_by_board, test_seq)
     
     # Verify Pass 2 results - load event should have cost
     load_event = None
@@ -483,15 +619,15 @@ def test_complete_compilation_pipeline():
     
     # Pass 3: Schedule and optimize
     print("    Pass 3: Scheduling and optimizing...")
-    _pass3_schedule_and_optimize(events_by_board)
+    schedule_and_optimize(events_by_board)
 
     # Pass 4: Check constraints
     print("    Pass 4: Checking constraints...")
-    _pass4_validate_constraints(events_by_board)  # Should not raise exception
+    validate_constraints(events_by_board)  # Should not raise exception
     
     # Pass 5: Generate final OASM calls
     print("    Pass 5: Generating final OASM calls...")
-    oasm_calls_by_board = _pass4_generate_oasm_calls(events_by_board)
+    oasm_calls_by_board = generate_scheduled_calls(events_by_board)
     
     # Extract calls for single board
     assert len(oasm_calls_by_board) == 1
@@ -609,7 +745,7 @@ def test_pipeline_pair_identification():
     print("  Created parallel morphism with two channels")
     
     # Extract events
-    events_by_board = _pass1_extract_and_translate(parallel_morphism)
+    events_by_board = extract_and_translate(parallel_morphism)
     rwg0_events = events_by_board[OASMAddress.RWG0]
     
     print(f"  Extracted {len(rwg0_events)} events from morphism")
@@ -617,7 +753,7 @@ def test_pipeline_pair_identification():
         print(f"    Event {i}: {event.operation.operation_type.name} on {event.operation.channel.global_id} at t={event.timestamp_cycles}c")
     
     # Test pipeline pair identification
-    pipeline_pairs = _identify_pipeline_pairs(rwg0_events)
+    pipeline_pairs = identify_pipeline_pairs(rwg0_events)
     
     print(f"  Identified {len(pipeline_pairs)} pipeline pairs:")
     for i, pair in enumerate(pipeline_pairs):
@@ -711,8 +847,8 @@ def test_intelligent_scheduling_optimization():
     print("  Created morphism: Ch0 PLAY@10μs, Ch1 PLAY@15μs")
     
     # Run through compiler passes
-    events_by_board = _pass1_extract_and_translate(parallel_morphism)
-    _pass2_cost_and_epoch_analysis(events_by_board)
+    events_by_board = extract_and_translate(parallel_morphism)
+    analyze_costs_and_epochs(events_by_board)
     
     # Set up assembler for cost analysis
     intf = sim_intf()
@@ -721,7 +857,7 @@ def test_intelligent_scheduling_optimization():
     run_all = run_cfg(intf, [0, 1])
     test_seq = assembler(run_all, [('rwg0', C_RWG)])
     
-    _pass2_cost_and_epoch_analysis(events_by_board, test_seq)
+    analyze_costs_and_epochs(events_by_board, test_seq)
     rwg0_events = events_by_board[OASMAddress.RWG0]
     
     print("  Original event timestamps:")
@@ -730,8 +866,8 @@ def test_intelligent_scheduling_optimization():
             print(f"    {event.operation.operation_type.name} on {event.operation.channel.global_id}: {event.timestamp_cycles}c")
     
     # Test intelligent scheduling
-    pipeline_pairs = _identify_pipeline_pairs(rwg0_events)
-    optimized_events = _calculate_optimal_schedule(rwg0_events, pipeline_pairs)
+    pipeline_pairs = identify_pipeline_pairs(rwg0_events)
+    optimized_events = calculate_optimal_schedule(rwg0_events, pipeline_pairs)
     
     print("  Optimized event timestamps:")
     optimization_found = False
@@ -781,3 +917,62 @@ def test_intelligent_scheduling_optimization():
     
     print("  ✅ All timing constraints verified after optimization")
     print("✅ Intelligent scheduling optimization test completed successfully!")
+
+
+def test_schedule_and_optimize_keeps_rwg_loads_within_epoch_boundaries():
+    main_board = Board("main")
+    rwg_board = Board("RWG0")
+    main_sync_ch = Channel(main_board, 0, ChannelType.TTL)
+    rwg_sync_ch = Channel(rwg_board, 0, ChannelType.TTL)
+    rwg_ch = Channel(rwg_board, 1, ChannelType.RWG)
+    waveform_params = WaveformParams(
+        sbg_id=0,
+        freq_coeffs=(10.0, None, None, None),
+        amp_coeffs=(0.5, None, None, None),
+        initial_phase=0.0,
+        phase_reset=True,
+    )
+
+    start_state = RWGReady(carrier_freq=100e6)
+    active_state = RWGActive(carrier_freq=100e6, rf_on=True)
+
+    pre_load = rwg_load_coeffs(rwg_ch, params=[waveform_params], start_state=start_state)
+    pre_play = rwg_update_params(rwg_ch, start_state=active_state, end_state=active_state)
+    post_load = rwg_load_coeffs(rwg_ch, params=[waveform_params], start_state=start_state)
+    post_play = rwg_update_params(rwg_ch, start_state=active_state, end_state=active_state)
+    main_sync = global_sync()(main_sync_ch, start_state=TTLState.OFF)
+    rwg_sync = global_sync()(rwg_sync_ch, start_state=TTLState.OFF)
+
+    events_by_board = {
+        OASMAddress.MAIN: [
+            LogicalEvent(timestamp_cycles=200, operation=main_sync.lanes[main_sync_ch].operations[0], cost_cycles=0),
+        ],
+        OASMAddress.RWG0: [
+            LogicalEvent(timestamp_cycles=100, operation=pre_load.lanes[rwg_ch].operations[0], cost_cycles=14),
+            LogicalEvent(timestamp_cycles=150, operation=pre_play.lanes[rwg_ch].operations[0], cost_cycles=0),
+            LogicalEvent(timestamp_cycles=200, operation=rwg_sync.lanes[rwg_sync_ch].operations[0], cost_cycles=0),
+            LogicalEvent(timestamp_cycles=240, operation=post_load.lanes[rwg_ch].operations[0], cost_cycles=14),
+            LogicalEvent(timestamp_cycles=300, operation=post_play.lanes[rwg_ch].operations[0], cost_cycles=0),
+        ],
+    }
+    detect_epoch_boundaries(events_by_board)
+
+    rwg_events = events_by_board[OASMAddress.RWG0]
+    assert [e.epoch for e in rwg_events] == [0, 0, 0, 1, 1]
+
+    schedule_and_optimize(events_by_board)
+
+    rwg_events_after = events_by_board[OASMAddress.RWG0]
+    sync_ts = next(
+        e.timestamp_cycles
+        for e in rwg_events_after
+        if e.operation.operation_type == OperationType.SYNC_SLAVE
+    )
+    epoch1_loads_after = [
+        e.timestamp_cycles
+        for e in rwg_events_after
+        if e.operation.operation_type == OperationType.RWG_LOAD_COEFFS and e.epoch == 1
+    ]
+
+    assert epoch1_loads_after, "expected a post-sync RWG load event after scheduling"
+    assert min(epoch1_loads_after) >= sync_ts

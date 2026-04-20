@@ -124,7 +124,11 @@ def test_pass3_generates_correct_rwg_calls():
     # Validate RWG_LOAD_WAVEFORM
     load_call = calls_by_func[OASMFunction.RWG_LOAD_WAVEFORM]
     expected_params = WaveformParams(
-        sbg_id=0, freq_coeffs=(15, None, None, None), amp_coeffs=(0.6, None, None, None), initial_phase=0.0, phase_reset=True
+        sbg_id=0,
+        freq_coeffs=(15, None, None, None),
+        amp_coeffs=(0.6, None, None, None),
+        initial_phase=0.0,
+        phase_reset=True,
     )
     assert load_call.args[0] == expected_params
 

@@ -8,6 +8,7 @@ using the >> operator to build complex sequences.
 
 from typing import List, Optional
 
+from ..debug import factory_breadcrumb
 from ..morphism import Morphism, MorphismDef, from_atomic
 from ..atomic import rwg_board_init, rwg_set_carrier, rwg_load_coeffs, rwg_update_params
 from ..morphism import identity
@@ -61,8 +62,8 @@ def set_state(targets: List[StaticWaveform],phase_reset=True) -> MorphismDef:
             params.append(
                 WaveformParams(
                     sbg_id=t.sbg_id,
-                    freq_coeffs=(t.freq, 0.0, 0.0, 0.0),
-                    amp_coeffs=(t.amp, 0.0, 0.0, 0.0),
+                    freq_coeffs=(t.freq, None, None, None),
+                    amp_coeffs=(t.amp, None, None, None),
                     initial_phase=t.phase,
                     phase_reset=phase_reset,
                     fct = t.fct,
@@ -742,6 +743,7 @@ def _create_rf_switch_morphism(on: bool) -> MorphismDef:
             end_state=end_state,
             duration_cycles=1,
             operation_type=OperationType.RWG_RF_SWITCH,
+            debug_trace=(factory_breadcrumb(stacklevel=1),),
         )
         return from_atomic(op)
 
